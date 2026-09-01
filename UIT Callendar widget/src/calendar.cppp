@@ -1,0 +1,418 @@
+#include "calendar.h"
+
+#include <algorithm>
+#include <cctype>
+#include <ctime>
+#include <filesystem>
+#include <fstream>
+#include <map>
+#include <sstream>
+#include <string_view>
+
+#include <windows.h>
+
+namespace {
+
+std::wstring Utf8ToWide(const std::string& value) {
+    if (value.empty()) return {};
+    int length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(),
+                                     static_cast<int>(value.size()), nullptr, 0);
+    if (length <= 0) {
+        length = MultiByteToWideChar(CP_ACP, 0, value.data(),
+                                     static_cast<int>(value.size()), nullptr, 0);
+        if (length <= 0) return L"";
+        std::wstring result(length, L'\0');
+        MultiByteToWideChar(CP_ACP, 0, value.data(), static_cast<int>(value.size()),
+                            result.data(), length);
+        return result;
+    }
+    std::wstring result(length, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, value.data(), static_cast<int>(value.size()),
+                        result.data(), length);
+    return result;
+}
+
+std::string UpperAscii(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return static_cast<char>(std::toupper(c));
+    });
+    return value;
+}
+
+std::wstring DecodeText(const std::string& value) {
+    std::string decoded;
+    decoded.reserve(value.size());
+    for (std::size_t i = 0; i < value.size(); ++i) {
+        if (value[i] == '\\' && i + 1 < value.size()) {
+            const char next = value[++i];
+            if (next == 'n' || next == 'N') decoded.push_back('\n');
+            else decoded.push_back(next);
+        } else {
+            decoded.push_back(value[i]);
+        }
+    }
+    return Utf8ToWide(decoded);
+}
+
+bool ParseDigits(const std::string& value, std::size_t offset, std::size_t count, int& out) {
+    if (offset + count > value.size()) return false;
+    int parsed = 0;
+    for (std::size_t i = 0; i < count; ++i) {
+        const char c = value[offset + i];
+        if (c < '0' || c > '9') return false;
+        parsed = parsed * 10 + (c - '0');
+    }
+    out = parsed;
+    return true;
+}
+
+bool ParseDateTime(const std::string& raw, bool dateOnlyHint, std::int64_t& result, bool& allDay) {
+    std::string value = raw;
+    const auto colon = value.find(':');
+    if (colon != std::string::npos) value = value.substr(colon + 1);
+
+    allDay = dateOnlyHint || value.size() == 8;
+    const bool utc = !value.empty() && value.back() == 'Z';
+
+    int year, month, day;
+    if (!ParseDigits(value, 0, 4, year) ||
+        !ParseDigits(value, 4, 2, month) ||
+        !ParseDigits(value, 6, 2, day)) return false;
+
+    int hour = 0;
+    int minute = 0;
+    int second = 0;
+    if (!allDay) {
+        if (value.size() < 13 || value[8] != 'T' ||
+            !ParseDigits(value, 9, 2, hour) ||
+            !ParseDigits(value, 11, 2, minute)) return false;
+        if (value.size() >= 15 && std::isdigit(static_cast<unsigned char>(value[13]))) {
+            if (!ParseDigits(value, 13, 2, second)) return false;
+        }
+    }
+
+    std::tm tm{};
+    tm.tm_year = year - 1900;
+    tm.tm_mon = month - 1;
+    tm.tm_mday = day;
+    tm.tm_hour = hour;
+    tm.tm_min = minute;
+    tm.tm_sec = second;
+    tm.tm_isdst = -1;
+
+    const __time64_t timestamp = utc ? _mkgmtime64(&tm) : _mktime64(&tm);
+    if (timestamp < 0) return false;
+    result = static_cast<std::int64_t>(timestamp);
+    return true;
+}
+
+std::vector<std::string> UnfoldLines(const std::string& text) {
+    std::vector<std::string> lines;
+    std::istringstream stream(text);
+    std::string line;
+    while (std::getline(stream, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (!line.empty() && (line.front() == ' ' || line.front() == '\t') && !lines.empty()) {
+            lines.back().append(line.substr(1));
+        } else {
+            lines.push_back(line);
+        }
+    }
+    return lines;
+}
+
+struct Property {
+    std::string name;
+    std::string parameters;
+    std::string value;
+};
+
+Property ParseProperty(const std::string& line) {
+    Property result;
+    const auto colon = line.find(':');
+    const std::string left = colon == std::string::npos ? line : line.substr(0, colon);
+    result.value = colon == std::string::npos ? "" : line.substr(colon + 1);
+    const auto semicolon = left.find(';');
+    result.name = UpperAscii(left.substr(0, semicolon));
+    if (semicolon != std::string::npos) {
+        result.parameters = UpperAscii(left.substr(semicolon + 1));
+    }
+    return result;
+}
+
+std::map<std::string, std::string> ParseRule(const std::string& rule) {
+    std::map<std::string, std::string> result;
+    std::size_t start = 0;
+    while (start <= rule.size()) {
+        const auto end = rule.find(';', start);
+        const std::string item = rule.substr(start, end == std::string::npos ? end : end - start);
+        const auto equals = item.find('=');
+        if (equals != std::string::npos) {
+            result[UpperAscii(item.substr(0, equals))] = UpperAscii(item.substr(equals + 1));
+        }
+        if (end == std::string::npos) break;
+        start = end + 1;
+    }
+    return result;
+}
+
+int ParsePositive(const std::map<std::string, std::string>& values,
+                  const std::string& key, int fallback) {
+    const auto it = values.find(key);
+    if (it == values.end()) return fallback;
+    try {
+        const int result = std::stoi(it->second);
+        return result > 0 ? result : fallback;
+    } catch (...) {
+        return fallback;
+    }
+}
+
+int WeekdayCode(const std::string& code) {
+    if (code == "SU") return 0;
+    if (code == "MO") return 1;
+    if (code == "TU") return 2;
+    if (code == "WE") return 3;
+    if (code == "TH") return 4;
+    if (code == "FR") return 5;
+    if (code == "SA") return 6;
+    return -1;
+}
+
+std::vector<int> ParseWeekdays(const std::string& value) {
+    std::vector<int> result;
+    std::size_t start = 0;
+    while (start <= value.size()) {
+        const auto end = value.find(',', start);
+        std::string token = value.substr(start, end == std::string::npos ? end : end - start);
+        if (token.size() >= 2) token = token.substr(token.size() - 2);
+        const int day = WeekdayCode(token);
+        if (day >= 0) result.push_back(day);
+        if (end == std::string::npos) break;
+        start = end + 1;
+    }
+    return result;
+}
+
+std::tm LocalTm(std::int64_t timestamp) {
+    std::tm value{};
+    const __time64_t native = static_cast<__time64_t>(timestamp);
+    _localtime64_s(&value, &native);
+    return value;
+}
+
+std::int64_t LocalTimestamp(std::tm value) {
+    value.tm_isdst = -1;
+    return static_cast<std::int64_t>(_mktime64(&value));
+}
+
+std::int64_t StartOfDay(std::int64_t timestamp) {
+    std::tm value = LocalTm(timestamp);
+    value.tm_hour = 0;
+    value.tm_min = 0;
+    value.tm_sec = 0;
+    return LocalTimestamp(value);
+}
+
+int MonthDifference(const std::tm& from, const std::tm& to) {
+    return (to.tm_year - from.tm_year) * 12 + (to.tm_mon - from.tm_mon);
+}
+
+bool IsExcepted(const CalendarEvent& event, std::int64_t occurrenceStart) {
+    return std::any_of(event.exceptionDates.begin(), event.exceptionDates.end(),
+                       [&](std::int64_t exception) {
+                           if (event.allDay) {
+                               return StartOfDay(exception) == StartOfDay(occurrenceStart);
+                           }
+                           return exception == occurrenceStart;
+                       });
+}
+
+void AddIfOverlapping(std::vector<CalendarEvent>& output,
+                      const CalendarEvent& source,
+                      std::int64_t occurrenceStart,
+                      std::int64_t rangeStart,
+                      std::int64_t rangeEnd) {
+    const std::int64_t duration = std::max<std::int64_t>(1, source.end - source.start);
+    const std::int64_t occurrenceEnd = occurrenceStart + duration;
+    if (occurrenceStart < rangeEnd && occurrenceEnd > rangeStart &&
+        !IsExcepted(source, occurrenceStart)) {
+        CalendarEvent copy = source;
+        copy.start = occurrenceStart;
+        copy.end = occurrenceEnd;
+        output.push_back(std::move(copy));
+    }
+}
+
+} // namespace
+
+CalendarParseResult LoadIcsFile(const std::wstring& path) {
+    CalendarParseResult result;
+    std::ifstream input(std::filesystem::path(path), std::ios::binary);
+    if (!input) {
+        result.warnings.push_back(L"Không thể mở file ICS.");
+        return result;
+    }
+    result.opened = true;
+
+    std::ostringstream bytes;
+    bytes << input.rdbuf();
+    const auto lines = UnfoldLines(bytes.str());
+
+    bool inEvent = false;
+    CalendarEvent event;
+    bool hasStart = false;
+    bool hasEnd = false;
+    bool cancelled = false;
+
+    for (const auto& line : lines) {
+        const Property property = ParseProperty(line);
+        if (property.name == "BEGIN" && UpperAscii(property.value) == "VEVENT") {
+            inEvent = true;
+            event = {};
+            hasStart = false;
+            hasEnd = false;
+            cancelled = false;
+            continue;
+        }
+        if (property.name == "END" && UpperAscii(property.value) == "VEVENT") {
+            if (inEvent && hasStart && !cancelled) {
+                if (!hasEnd) event.end = event.start + (event.allDay ? 86400 : 3600);
+                if (event.end <= event.start) event.end = event.start + (event.allDay ? 86400 : 3600);
+                if (event.title.empty()) event.title = L"(Không có tiêu đề)";
+                result.events.push_back(std::move(event));
+            }
+            inEvent = false;
+            continue;
+        }
+        if (!inEvent) continue;
+
+        if (property.name == "UID") event.uid = DecodeText(property.value);
+        else if (property.name == "SUMMARY") event.title = DecodeText(property.value);
+        else if (property.name == "DESCRIPTION") event.description = DecodeText(property.value);
+        else if (property.name == "LOCATION") event.location = DecodeText(property.value);
+        else if (property.name == "STATUS" && UpperAscii(property.value) == "CANCELLED") {
+            cancelled = true;
+        } else if (property.name == "DTSTART") {
+            bool allDay = property.parameters.find("VALUE=DATE") != std::string::npos;
+            hasStart = ParseDateTime(property.value, allDay, event.start, event.allDay);
+        } else if (property.name == "DTEND") {
+            bool ignored = property.parameters.find("VALUE=DATE") != std::string::npos;
+            hasEnd = ParseDateTime(property.value, ignored, event.end, ignored);
+        } else if (property.name == "DURATION") {
+            result.warnings.push_back(L"DURATION chưa được hỗ trợ; event sẽ dùng thời lượng mặc định.");
+        } else if (property.name == "RRULE") {
+            event.recurrenceRule = property.value;
+        } else if (property.name == "EXDATE") {
+            std::size_t start = 0;
+            while (start <= property.value.size()) {
+                const auto comma = property.value.find(',', start);
+                const std::string item = property.value.substr(
+                    start, comma == std::string::npos ? comma : comma - start);
+                std::int64_t exception = 0;
+                bool allDay = false;
+                if (ParseDateTime(item,
+                                  property.parameters.find("VALUE=DATE") != std::string::npos,
+                                  exception, allDay)) {
+                    event.exceptionDates.push_back(exception);
+                }
+                if (comma == std::string::npos) break;
+                start = comma + 1;
+            }
+        }
+    }
+
+    if (inEvent) result.warnings.push_back(L"File ICS kết thúc giữa một VEVENT.");
+    return result;
+}
+
+std::vector<CalendarEvent> EventsInRange(const std::vector<CalendarEvent>& source,
+                                         std::int64_t rangeStart,
+                                         std::int64_t rangeEnd) {
+    std::vector<CalendarEvent> result;
+
+    for (const auto& event : source) {
+        if (event.recurrenceRule.empty()) {
+            AddIfOverlapping(result, event, event.start, rangeStart, rangeEnd);
+            continue;
+        }
+
+        const auto rule = ParseRule(event.recurrenceRule);
+        const auto frequencyIt = rule.find("FREQ");
+        if (frequencyIt == rule.end()) {
+            AddIfOverlapping(result, event, event.start, rangeStart, rangeEnd);
+            continue;
+        }
+
+        const std::string frequency = frequencyIt->second;
+        const int interval = ParsePositive(rule, "INTERVAL", 1);
+        const int maxCount = ParsePositive(rule, "COUNT", 1000000);
+        std::int64_t until = INT64_MAX;
+        const auto untilIt = rule.find("UNTIL");
+        if (untilIt != rule.end()) {
+            bool ignored = false;
+            ParseDateTime(untilIt->second, false, until, ignored);
+        }
+
+        std::vector<int> weekdays;
+        const auto daysIt = rule.find("BYDAY");
+        if (daysIt != rule.end()) weekdays = ParseWeekdays(daysIt->second);
+
+        const std::tm base = LocalTm(event.start);
+        const std::int64_t baseDay = StartOfDay(event.start);
+        std::int64_t cursor = baseDay;
+        int occurrenceCount = 0;
+
+        // A bounded daily scan keeps the recurrence implementation small and
+        // still handles the common DAILY, WEEKLY and MONTHLY rules.
+        const std::int64_t scanEnd = std::min<std::int64_t>(
+            rangeEnd + 370 * 86400LL,
+            event.start + 80LL * 366 * 86400);
+        while (cursor < scanEnd && occurrenceCount < maxCount) {
+            std::tm day = LocalTm(cursor);
+            const int dayDifference = static_cast<int>((StartOfDay(cursor) - baseDay) / 86400);
+            bool matches = false;
+
+            if (cursor >= baseDay && frequency == "DAILY") {
+                matches = dayDifference % interval == 0;
+            } else if (cursor >= baseDay && frequency == "WEEKLY") {
+                const int weekDifference = dayDifference / 7;
+                const bool selectedDay = weekdays.empty()
+                    ? day.tm_wday == base.tm_wday
+                    : std::find(weekdays.begin(), weekdays.end(), day.tm_wday) != weekdays.end();
+                matches = weekDifference % interval == 0 && selectedDay;
+            } else if (cursor >= baseDay && frequency == "MONTHLY") {
+                const int monthDifference = MonthDifference(base, day);
+                const bool selectedDay = weekdays.empty()
+                    ? day.tm_mday == base.tm_mday
+                    : std::find(weekdays.begin(), weekdays.end(), day.tm_wday) != weekdays.end();
+                matches = monthDifference >= 0 &&
+                          monthDifference % interval == 0 &&
+                          selectedDay;
+            }
+
+            if (matches) {
+                day.tm_hour = base.tm_hour;
+                day.tm_min = base.tm_min;
+                day.tm_sec = base.tm_sec;
+                const std::int64_t occurrence = LocalTimestamp(day);
+                if (occurrence >= event.start && occurrence <= until) {
+                    ++occurrenceCount;
+                    AddIfOverlapping(result, event, occurrence, rangeStart, rangeEnd);
+                }
+                if (occurrence > until) break;
+            }
+
+            day = LocalTm(cursor);
+            day.tm_mday += 1;
+            cursor = StartOfDay(LocalTimestamp(day));
+        }
+    }
+
+    std::sort(result.begin(), result.end(), [](const CalendarEvent& left, const CalendarEvent& right) {
+        if (left.start != right.start) return left.start < right.start;
+        if (left.allDay != right.allDay) return left.allDay;
+        return left.title < right.title;
+    });
+    return result;
+}
