@@ -15,3 +15,8 @@ Original implementation: [OpenCVProjects/laplacian_variance_blur_detection.ipynb
 * [Kernel / Image Processing (Wikipedia)](https://en.wikipedia.org/wiki/Kernel_(image_processing))
 * [Go Interfaces (Russ Cox)](https://research.swtch.com/interfaces)
 * [Algorithms for calculating variance (Wikipedia)](https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance)
+
+### Running
+To run use --> go run . "{Your Path to Image}"
+
+
